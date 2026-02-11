@@ -7,8 +7,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"syscall"
 
 	"golang.org/x/sys/windows"
 )
@@ -214,24 +212,4 @@ func IsWindows() bool {
 // PathSeparator returns the OS-specific path separator
 func PathSeparator() string {
 	return "\\"
-}
-
-// getWindowsConfigPath returns the config file path for Windows
-func getWindowsConfigPath() string {
-	// Try APPDATA first
-	if appData := os.Getenv("APPDATA"); appData != "" {
-		return filepath.Join(appData, "ai-terminal-tui", "config.json")
-	}
-
-	// Fall back to LOCALAPPDATA
-	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
-		return filepath.Join(localAppData, "ai-terminal-tui", "config.json")
-	}
-
-	// Last resort: use UserProfile
-	if userProfile := os.Getenv("USERPROFILE"); userProfile != "" {
-		return filepath.Join(userProfile, ".config", "ai-terminal-tui", "config.json")
-	}
-
-	return ""
 }

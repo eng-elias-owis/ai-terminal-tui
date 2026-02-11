@@ -79,9 +79,9 @@ build-all: build-linux build-windows build-darwin
 
 ## install: Install via go install
 install:
-	@echo "Installing $(MODULE)@latest..."
-	$(GOINSTALL) $(LDFLAGS) $(MODULE)@latest
-	@echo "Installation complete!"
+	@echo "Installing $(BINARY_NAME)..."
+	$(GOINSTALL) $(LDFLAGS) .
+	@echo "Installation complete! Binary installed to $(GOPATH)/bin or ~/go/bin/"
 
 ## test: Run tests
 test:
