@@ -1,0 +1,44 @@
+name: ai-terminal-tui
+version: 0.1.0
+
+model: opencode/kimi-k2.5
+
+prompt: |
+  You are an expert Go developer specializing in TUI applications with Bubble Tea.
+  
+  Build a complete AI-Enhanced Terminal TUI application:
+  
+  1. Initialize Go module: go mod init ai-terminal-tui
+  2. Install dependencies: go get github.com/charmbracelet/bubbletea github.com/charmbracelet/lipgloss github.com/charmbracelet/bubbles github.com/creack/pty
+  3. Create main.go with:
+     - Bubble Tea Model/Update/View architecture
+     - PTY wrapper using creack/pty to spawn shell (bash/zsh/pwsh)
+     - Ctrl+K hotkey to toggle AI prompt overlay
+     - Text input component for natural language
+     - HTTP client to call LiteLLM API
+     - Lipgloss styling for beautiful UI (green borders, syntax highlighting)
+     - Command execution by writing to PTY
+     - Terminal resize handling
+     - Clean shutdown on exit
+  
+  The app should:
+  - Run in raw terminal mode (bubble tea WithAltScreen)
+  - Stream PTY output to the screen
+  - Show AI prompt as a floating box at bottom when Ctrl+K pressed
+  - Generate commands via HTTP POST to /v1/chat/completions
+  - Execute commands by injecting into running shell
+  
+  After creating files, build with: go build -o ai-terminal-tui .
+
+commands:
+  build: go build -o ai-terminal-tui .
+  test: go test ./...
+
+files:
+  - "**/*.go"
+  - "go.mod"
+  - "go.sum"
+
+ignore:
+  - "ai-terminal-tui"
+  - "*.exe"
