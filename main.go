@@ -16,14 +16,21 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/creack/pty"
+	"github.com/mattn/go-isatty"
+)
+
+// Version information
+const (
+	Version = "1.1.0"
+	AppName = "ai-terminal-tui"
 )
 
 // Config represents the application configuration
 type Config struct {
-	LiteLLMURL    string `json:"litellm_url"`
-	LiteLLMToken  string `json:"litellm_token"`
-	Model         string `json:"model"`
-	Shell         string `json:"shell"`
+	LiteLLMURL   string `json:"litellm_url"`
+	LiteLLMToken string `json:"litellm_token"`
+	Model        string `json:"model"`
+	Shell        string `json:"shell"`
 }
 
 // Default configuration
@@ -40,64 +47,149 @@ func defaultConfig() Config {
 	}
 }
 
+// GetConfigPath returns the path to the config file
+func GetConfigPath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".config", "ai-terminal-tui", "config.json")
+}
+
+// EnsureConfigDir creates the config directory if it doesn't exist
+func EnsureConfigDir() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	configDir := filepath.Join(homeDir, ".config", "ai-terminal-tui")
+	return os.MkdirAll(configDir, 0755)
+}
+
 // LoadConfig loads configuration from file or returns defaults
 func LoadConfig() Config {
 	config := defaultConfig()
-	
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+
+	configPath := GetConfigPath()
+	if configPath == "" {
 		return config
 	}
-	
-	configPath := filepath.Join(homeDir, ".config", "ai-terminal-tui", "config.json")
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return config
 	}
-	
+
 	json.Unmarshal(data, &config)
 	return config
 }
 
+// SaveConfig saves the configuration to file
+func SaveConfig(config Config) error {
+	if err := EnsureConfigDir(); err != nil {
+		return err
+	}
+
+	configPath := GetConfigPath()
+	if configPath == "" {
+		return fmt.Errorf("unable to determine config path")
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(configPath, data, 0600)
+}
+
+// UpdateConfigKey updates a single configuration key
+func UpdateConfigKey(key, value string) error {
+	config := LoadConfig()
+
+	switch key {
+	case "litellm_url":
+		config.LiteLLMURL = value
+	case "litellm_token":
+		config.LiteLLMToken = value
+	case "model":
+		config.Model = value
+	case "shell":
+		config.Shell = value
+	default:
+		return fmt.Errorf("unknown config key: %s", key)
+	}
+
+	return SaveConfig(config)
+}
+
+// DisplayConfig prints the current configuration
+func DisplayConfig() {
+	config := LoadConfig()
+	configPath := GetConfigPath()
+
+	fmt.Printf("Configuration file: %s\n\n", configPath)
+	fmt.Printf("  litellm_url:   %s\n", config.LiteLLMURL)
+	fmt.Printf("  litellm_token: %s\n", maskToken(config.LiteLLMToken))
+	fmt.Printf("  model:         %s\n", config.Model)
+	fmt.Printf("  shell:         %s\n", config.Shell)
+}
+
+// maskToken masks the token for display
+func maskToken(token string) string {
+	if token == "" {
+		return "(not set)"
+	}
+	if len(token) <= 8 {
+		return "****"
+	}
+	return token[:4] + "..." + token[len(token)-4:]
+}
+
+// IsTTY returns true if stdout is a terminal
+func IsTTY() bool {
+	return isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+}
+
 // Model represents the Bubble Tea application state
 type Model struct {
-	config      Config
-	pty         *os.File
-	cmd         *exec.Cmd
-	output      []byte
-	width       int
-	height      int
-	showPrompt  bool
-	input       textinput.Model
-	aiResponse  string
-	loading     bool
-	err         error
-	cursorX     int
-	cursorY     int
+	config     Config
+	pty        *os.File
+	cmd        *exec.Cmd
+	output     []byte
+	width      int
+	height     int
+	showPrompt bool
+	input      textinput.Model
+	aiResponse string
+	loading    bool
+	err        error
+	cursorX    int
+	cursorY    int
 }
 
 // Messages
 type (
-	ptyMsg      []byte
-	aiResponse  string
-	errMsg      error
-	resizeMsg   struct{ width, height int }
+	ptyMsg     []byte
+	aiResponse string
+	errMsg     error
+	resizeMsg  struct{ width, height int }
 )
 
 // NewModel creates a new application model
 func NewModel() Model {
 	config := LoadConfig()
-	
+
 	ti := textinput.New()
-	 ti.Placeholder = "Describe what you want to do..."
-	 ti.Focus()
-	 ti.CharLimit = 200
-	 ti.Width = 50
-	 
+	ti.Placeholder = "Describe what you want to do..."
+	ti.Focus()
+	ti.CharLimit = 200
+	ti.Width = 50
+
 	return Model{
-		config:  config,
-		input:   ti,
-		output:  make([]byte, 0),
+		config: config,
+		input:  ti,
+		output: make([]byte, 0),
 	}
 }
 
@@ -113,15 +205,15 @@ func (m Model) Init() tea.Cmd {
 func (m *Model) initPTY() tea.Cmd {
 	return func() tea.Msg {
 		cmd := exec.Command(m.config.Shell)
-		
+
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
 			return errMsg(err)
 		}
-		
+
 		m.pty = ptmx
 		m.cmd = cmd
-		
+
 		// Read from PTY
 		return m.readPTY()
 	}
@@ -132,7 +224,7 @@ func (m *Model) readPTY() tea.Msg {
 	if m.pty == nil {
 		return nil
 	}
-	
+
 	buf := make([]byte, 4096)
 	n, err := m.pty.Read(buf)
 	if err != nil {
@@ -141,7 +233,7 @@ func (m *Model) readPTY() tea.Msg {
 		}
 		return errMsg(err)
 	}
-	
+
 	return ptyMsg(buf[:n])
 }
 
@@ -170,14 +262,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		
+
 		// Handle escape to close prompt
 		if msg.Type == tea.KeyEsc && m.showPrompt {
 			m.showPrompt = false
 			m.input.Blur()
 			return m, nil
 		}
-		
+
 		// Handle enter in AI prompt
 		if msg.Type == tea.KeyEnter && m.showPrompt {
 			query := m.input.Value()
@@ -189,25 +281,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showPrompt = false
 			return m, nil
 		}
-		
+
 		// Pass keys to text input when prompt is shown
 		if m.showPrompt {
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
 			return m, cmd
 		}
-		
+
 		// Pass keys to PTY when prompt is not shown
 		if m.pty != nil {
 			if key := teaKeyToBytes(msg); key != nil {
 				m.pty.Write(key)
 			}
 		}
-		
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		
+
 		// Resize PTY
 		if m.pty != nil {
 			pty.Setsize(m.pty, &pty.Winsize{
@@ -215,7 +307,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Cols: uint16(m.width),
 			})
 		}
-		
+
 	case ptyMsg:
 		m.output = append(m.output, msg...)
 		// Keep output buffer manageable
@@ -223,7 +315,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.output = m.output[len(m.output)-50000:]
 		}
 		return m, m.readPTY
-		
+
 	case aiResponse:
 		m.aiResponse = string(msg)
 		m.loading = false
@@ -237,16 +329,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.showPrompt = false
 		m.input.Blur()
 		return m, nil
-		
+
 	case errMsg:
 		m.err = msg
 		return m, nil
-		
+
 	case time.Time:
 		// Periodic tick for PTY reading
 		return m, tea.Batch(m.readPTY, tick())
 	}
-	
+
 	return m, nil
 }
 
@@ -311,77 +403,86 @@ func teaKeyToBytes(k tea.KeyMsg) []byte {
 // queryAI sends a query to the LiteLLM API
 func (m Model) queryAI(query string) tea.Cmd {
 	return func() tea.Msg {
-		prompt := fmt.Sprintf(
-			"You are a helpful assistant that converts natural language descriptions into shell commands. "+
-			"Respond with ONLY the command, no explanations, no markdown formatting, no quotes. "+
-			"If you're unsure, provide the most likely command.\n\n"+
-			"User request: %s\n\n"+
-			"Shell command:",
-			query,
-		)
-		
-		requestBody := map[string]interface{}{
-			"model": m.config.Model,
-			"messages": []map[string]string{
-				{"role": "user", "content": prompt},
-			},
-			"temperature": 0.1,
-			"max_tokens":  200,
-		}
-		
-		jsonBody, err := json.Marshal(requestBody)
+		response, err := GenerateCommand(m.config, query)
 		if err != nil {
 			return errMsg(err)
 		}
-		
-		url := strings.TrimSuffix(m.config.LiteLLMURL, "/") + "/v1/chat/completions"
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
-		if err != nil {
-			return errMsg(err)
-		}
-		
-		req.Header.Set("Content-Type", "application/json")
-		if m.config.LiteLLMToken != "" {
-			req.Header.Set("Authorization", "Bearer "+m.config.LiteLLMToken)
-		}
-		
-		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return errMsg(err)
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return errMsg(fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body)))
-		}
-		
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-		
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return errMsg(err)
-		}
-		
-		if len(result.Choices) > 0 {
-			content := strings.TrimSpace(result.Choices[0].Message.Content)
-			// Remove any markdown code block formatting
-			content = strings.TrimPrefix(content, "```bash")
-			content = strings.TrimPrefix(content, "```sh")
-			content = strings.TrimPrefix(content, "```shell")
-			content = strings.TrimPrefix(content, "```")
-			content = strings.TrimSuffix(content, "```")
-			return aiResponse(strings.TrimSpace(content))
-		}
-		
-		return aiResponse("")
+		return aiResponse(response)
 	}
+}
+
+// GenerateCommand generates a shell command from a natural language query
+func GenerateCommand(config Config, query string) (string, error) {
+	prompt := fmt.Sprintf(
+		"You are a helpful assistant that converts natural language descriptions into shell commands. "+
+		"Respond with ONLY the command, no explanations, no markdown formatting, no quotes. "+
+		"If you're unsure, provide the most likely command.\n\n"+
+		"User request: %s\n\n"+
+		"Shell command:",
+		query,
+	)
+
+	requestBody := map[string]interface{}{
+		"model": config.Model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.1,
+		"max_tokens":  200,
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", err
+	}
+
+	url := strings.TrimSuffix(config.LiteLLMURL, "/") + "/v1/chat/completions"
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if config.LiteLLMToken != "" {
+		req.Header.Set("Authorization", "Bearer "+config.LiteLLMToken)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if len(result.Choices) > 0 {
+		content := strings.TrimSpace(result.Choices[0].Message.Content)
+		// Remove any markdown code block formatting
+		content = strings.TrimPrefix(content, "```bash")
+		content = strings.TrimPrefix(content, "```sh")
+		content = strings.TrimPrefix(content, "```shell")
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		return strings.TrimSpace(content), nil
+	}
+
+	return "", fmt.Errorf("no response from AI")
 }
 
 // View renders the UI
@@ -389,28 +490,28 @@ func (m Model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
-	
+
 	// Terminal output
 	termHeight := m.height
 	if m.showPrompt {
 		termHeight = m.height - 5
 	}
-	
+
 	// Truncate and format output
 	output := string(m.output)
 	lines := strings.Split(output, "\n")
 	if len(lines) > termHeight-2 {
 		lines = lines[len(lines)-(termHeight-2):]
 	}
-	
+
 	// Style the terminal area
 	terminalStyle := lipgloss.NewStyle().
 		Width(m.width - 2).
 		Height(termHeight - 2).
 		Padding(0, 1)
-	
+
 	terminalContent := terminalStyle.Render(strings.Join(lines, "\n"))
-	
+
 	// Show AI prompt overlay if active
 	if m.showPrompt {
 		// Prompt box styling
@@ -420,11 +521,11 @@ func (m Model) View() string {
 			Background(lipgloss.Color("0")).
 			Padding(1, 2).
 			Width(m.width - 4)
-		
+
 		titleStyle := lipgloss.NewStyle().
 			Foreground(lipgloss.Color("10")).
 			Bold(true)
-		
+
 		var promptContent string
 		if m.loading {
 			promptContent = "Generating command..."
@@ -436,9 +537,9 @@ func (m Model) View() string {
 				lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Describe what you want to do and press Enter"),
 			)
 		}
-		
+
 		promptBox := promptStyle.Render(promptContent)
-		
+
 		// Stack terminal and prompt
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
@@ -446,7 +547,7 @@ func (m Model) View() string {
 			promptBox,
 		)
 	}
-	
+
 	return terminalContent
 }
 
@@ -460,30 +561,267 @@ func (m *Model) Cleanup() {
 	}
 }
 
-func main() {
-	// Ensure config directory exists
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		configDir := filepath.Join(homeDir, ".config", "ai-terminal-tui")
-		os.MkdirAll(configDir, 0755)
+// printHelp prints the help message
+func printHelp() {
+	fmt.Printf(`%s - AI Terminal TUI with headless support
+
+Version: %s
+
+USAGE:
+  ai-terminal-tui [COMMAND] [OPTIONS]
+
+COMMANDS:
+  setup                     Interactive setup wizard
+  config                    Show current configuration
+  config --show             Same as 'config'
+  config --set-key KEY VALUE  Set a configuration value
+  generate "QUERY"          Generate shell command from description (headless)
+  --help, -h                Show this help message
+  --version, -v             Show version information
+
+CONFIGURATION KEYS:
+  litellm_url    - LiteLLM API URL (default: http://localhost:4000)
+  litellm_token  - LiteLLM API token
+  model          - Model to use (default: gpt-4)
+  shell          - Shell to use (default: $SHELL or /bin/bash)
+
+EXAMPLES:
+  # Run TUI mode (requires TTY)
+  ai-terminal-tui
+
+  # Setup wizard
+  ai-terminal-tui setup
+
+  # Configure API URL
+  ai-terminal-tui config --set-key litellm_url "http://localhost:4000"
+
+  # Configure API token
+  ai-terminal-tui config --set-key litellm_token "sk-..."
+
+  # Generate command (headless mode)
+  ai-terminal-tui generate "list all files"
+
+  # Generate and execute command
+  ai-terminal-tui generate "show disk usage" | sh
+
+MODES:
+  TTY Mode    - When run in a terminal with TTY, starts the interactive TUI
+  CLI Mode    - When run without TTY or with arguments, uses CLI commands
+
+`, AppName, Version)
+}
+
+// runSetupWizard runs the interactive setup wizard
+func runSetupWizard() {
+	fmt.Println("╔════════════════════════════════════════════════════════╗")
+	fmt.Println("║     AI Terminal TUI - Setup Wizard                      ║")
+	fmt.Println("╚════════════════════════════════════════════════════════╝")
+	fmt.Println()
+
+	config := LoadConfig()
+
+	// LiteLLM URL
+	fmt.Printf("LiteLLM URL [%s]: ", config.LiteLLMURL)
+	var url string
+	fmt.Scanln(&url)
+	if url != "" {
+		config.LiteLLMURL = url
 	}
-	
+
+	// LiteLLM Token
+	fmt.Printf("LiteLLM Token [%s]: ", maskToken(config.LiteLLMToken))
+	var token string
+	fmt.Scanln(&token)
+	if token != "" {
+		config.LiteLLMToken = token
+	}
+
+	// Model
+	fmt.Printf("Model [%s]: ", config.Model)
+	var model string
+	fmt.Scanln(&model)
+	if model != "" {
+		config.Model = model
+	}
+
+	// Shell
+	fmt.Printf("Shell [%s]: ", config.Shell)
+	var shell string
+	fmt.Scanln(&shell)
+	if shell != "" {
+		config.Shell = shell
+	}
+
+	fmt.Println()
+
+	// Save configuration
+	if err := SaveConfig(config); err != nil {
+		fmt.Printf("Error saving configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("✓ Configuration saved successfully!")
+	fmt.Printf("  Location: %s\n", GetConfigPath())
+	fmt.Println()
+	fmt.Println("You can now run 'ai-terminal-tui' to start the TUI.")
+}
+
+// handleConfigCommand handles the config subcommand
+func handleConfigCommand(args []string) {
+	if len(args) == 0 {
+		// Show config
+		DisplayConfig()
+		return
+	}
+
+	// Parse flags
+	setKey := ""
+	setValue := ""
+	showFlag := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--show":
+			showFlag = true
+		case "--set-key":
+			if i+2 < len(args) {
+				setKey = args[i+1]
+				setValue = args[i+2]
+				i += 2
+			} else {
+				fmt.Println("Error: --set-key requires KEY and VALUE arguments")
+				os.Exit(1)
+			}
+		}
+	}
+
+	if showFlag {
+		DisplayConfig()
+		return
+	}
+
+	if setKey != "" {
+		if err := UpdateConfigKey(setKey, setValue); err != nil {
+			fmt.Printf("Error updating config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Updated %s = %s\n", setKey, setValue)
+		return
+	}
+
+	// If no recognized flags, show help
+	fmt.Println("Usage: ai-terminal-tui config [--show] [--set-key KEY VALUE]")
+}
+
+// handleGenerateCommand handles the generate subcommand
+func handleGenerateCommand(query string) {
+	if query == "" {
+		fmt.Println("Error: generate command requires a query string")
+		fmt.Println("Usage: ai-terminal-tui generate \"your query here\"")
+		os.Exit(1)
+	}
+
+	config := LoadConfig()
+
+	// Validate config
+	if config.LiteLLMURL == "" {
+		fmt.Println("Error: litellm_url not configured. Run 'ai-terminal-tui setup' first.")
+		os.Exit(1)
+	}
+
+	response, err := GenerateCommand(config, query)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(response)
+}
+
+// runTUIMode starts the TUI application
+func runTUIMode() {
+	// Check if we actually have a TTY
+	if !IsTTY() {
+		fmt.Println("Error: No TTY detected. Cannot run TUI mode.")
+		fmt.Println("Use CLI commands instead:")
+		fmt.Println("  ai-terminal-tui --help")
+		fmt.Println("  ai-terminal-tui generate \"your query\"")
+		os.Exit(1)
+	}
+
 	model := NewModel()
-	
+
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
-	
+
 	m, err := p.Run()
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Cleanup
 	if finalModel, ok := m.(Model); ok {
 		finalModel.Cleanup()
+	}
+}
+
+func main() {
+	// Ensure config directory exists
+	EnsureConfigDir()
+
+	// Check if running with arguments
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--help", "-h":
+			printHelp()
+			os.Exit(0)
+
+		case "--version", "-v":
+			fmt.Printf("%s version %s\n", AppName, Version)
+			os.Exit(0)
+
+		case "setup":
+			runSetupWizard()
+			os.Exit(0)
+
+		case "config":
+			handleConfigCommand(os.Args[2:])
+			os.Exit(0)
+
+		case "generate":
+			if len(os.Args) > 2 {
+				handleGenerateCommand(os.Args[2])
+			} else {
+				handleGenerateCommand("")
+			}
+			os.Exit(0)
+
+		default:
+			// Check if it's a flag we don't recognize
+			if strings.HasPrefix(os.Args[1], "-") {
+				fmt.Printf("Unknown option: %s\n\n", os.Args[1])
+				printHelp()
+				os.Exit(1)
+			}
+			// Treat as generate command
+			handleGenerateCommand(os.Args[1])
+			os.Exit(0)
+		}
+	}
+
+	// No arguments - check for TTY and run appropriate mode
+	if IsTTY() {
+		runTUIMode()
+	} else {
+		// No TTY and no arguments - show help
+		fmt.Println("AI Terminal TUI - Headless/CLI Mode")
+		fmt.Println()
+		fmt.Println("No TTY detected and no command specified.")
+		fmt.Println()
+		printHelp()
 	}
 }
