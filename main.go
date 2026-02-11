@@ -7,23 +7,25 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/creack/pty"
 	"github.com/mattn/go-isatty"
 )
 
-// Version information
-const (
-	Version = "1.1.0"
-	AppName = "ai-terminal-tui"
+// Version information - these are set by the build process
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+	GitCommit = "unknown"
 )
+
+const AppName = "ai-terminal-tui"
 
 // Config represents the application configuration
 type Config struct {
@@ -35,15 +37,11 @@ type Config struct {
 
 // Default configuration
 func defaultConfig() Config {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
-	}
 	return Config{
 		LiteLLMURL:   "http://localhost:4000",
 		LiteLLMToken: "",
 		Model:        "gpt-4",
-		Shell:        shell,
+		Shell:        GetDefaultShell(),
 	}
 }
 
@@ -53,7 +51,33 @@ func GetConfigPath() string {
 	if err != nil {
 		return ""
 	}
+
+	// On Windows, use a different path
+	if runtime.GOOS == "windows" {
+		return getWindowsConfigPath()
+	}
+
 	return filepath.Join(homeDir, ".config", "ai-terminal-tui", "config.json")
+}
+
+// getWindowsConfigPath returns the config path for Windows
+func getWindowsConfigPath() string {
+	// Try APPDATA first
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		return filepath.Join(appData, "ai-terminal-tui", "config.json")
+	}
+
+	// Fall back to LOCALAPPDATA
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		return filepath.Join(localAppData, "ai-terminal-tui", "config.json")
+	}
+
+	// Last resort: use UserProfile
+	if userProfile := os.Getenv("USERPROFILE"); userProfile != "" {
+		return filepath.Join(userProfile, ".config", "ai-terminal-tui", "config.json")
+	}
+
+	return ""
 }
 
 // EnsureConfigDir creates the config directory if it doesn't exist
@@ -62,7 +86,20 @@ func EnsureConfigDir() error {
 	if err != nil {
 		return err
 	}
-	configDir := filepath.Join(homeDir, ".config", "ai-terminal-tui")
+
+	var configDir string
+	if runtime.GOOS == "windows" {
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			configDir = filepath.Join(appData, "ai-terminal-tui")
+		} else if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			configDir = filepath.Join(localAppData, "ai-terminal-tui")
+		} else {
+			configDir = filepath.Join(homeDir, ".config", "ai-terminal-tui")
+		}
+	} else {
+		configDir = filepath.Join(homeDir, ".config", "ai-terminal-tui")
+	}
+
 	return os.MkdirAll(configDir, 0755)
 }
 
@@ -154,8 +191,7 @@ func IsTTY() bool {
 // Model represents the Bubble Tea application state
 type Model struct {
 	config     Config
-	pty        *os.File
-	cmd        *exec.Cmd
+	pty        *PTY
 	output     []byte
 	width      int
 	height     int
@@ -164,16 +200,13 @@ type Model struct {
 	aiResponse string
 	loading    bool
 	err        error
-	cursorX    int
-	cursorY    int
 }
 
 // Messages
 type (
 	ptyMsg     []byte
-	aiResponse string
+	aiResponseMsg string
 	errMsg     error
-	resizeMsg  struct{ width, height int }
 )
 
 // NewModel creates a new application model
@@ -204,23 +237,22 @@ func (m Model) Init() tea.Cmd {
 // initPTY initializes the PTY and shell
 func (m *Model) initPTY() tea.Cmd {
 	return func() tea.Msg {
-		cmd := exec.Command(m.config.Shell)
-
-		ptmx, err := pty.Start(cmd)
+		pty, err := NewPTY(m.config.Shell)
 		if err != nil {
 			return errMsg(err)
 		}
 
-		m.pty = ptmx
-		m.cmd = cmd
+		m.pty = pty
 
 		// Read from PTY
-		return m.readPTY()
+		return func() tea.Msg {
+			return m.readPTYMsg()
+		}
 	}
 }
 
-// readPTY reads output from the PTY
-func (m *Model) readPTY() tea.Msg {
+// readPTYMsg reads output from the PTY and returns a message
+func (m *Model) readPTYMsg() tea.Msg {
 	if m.pty == nil {
 		return nil
 	}
@@ -235,6 +267,13 @@ func (m *Model) readPTY() tea.Msg {
 	}
 
 	return ptyMsg(buf[:n])
+}
+
+// readPTY returns a command that reads from the PTY
+func (m *Model) readPTY() tea.Cmd {
+	return func() tea.Msg {
+		return m.readPTYMsg()
+	}
 }
 
 // tick creates a command that reads from PTY periodically
@@ -255,10 +294,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 			} else {
 				m.input.Blur()
-				// Return focus to terminal
-				if m.pty != nil {
-					m.pty.Write([]byte{0})
-				}
 			}
 			return m, nil
 		}
@@ -302,10 +337,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Resize PTY
 		if m.pty != nil {
-			pty.Setsize(m.pty, &pty.Winsize{
-				Rows: uint16(m.height - 3),
-				Cols: uint16(m.width),
-			})
+			m.pty.Resize(m.width, m.height-3)
 		}
 
 	case ptyMsg:
@@ -314,9 +346,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.output) > 100000 {
 			m.output = m.output[len(m.output)-50000:]
 		}
-		return m, m.readPTY
+		return m, m.readPTY()
 
-	case aiResponse:
+	case aiResponseMsg:
 		m.aiResponse = string(msg)
 		m.loading = false
 		// Execute the command in the shell
@@ -336,7 +368,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case time.Time:
 		// Periodic tick for PTY reading
-		return m, tea.Batch(m.readPTY, tick())
+		return m, tea.Batch(m.readPTY(), tick())
 	}
 
 	return m, nil
@@ -407,7 +439,7 @@ func (m Model) queryAI(query string) tea.Cmd {
 		if err != nil {
 			return errMsg(err)
 		}
-		return aiResponse(response)
+		return aiResponseMsg(response)
 	}
 }
 
@@ -415,10 +447,10 @@ func (m Model) queryAI(query string) tea.Cmd {
 func GenerateCommand(config Config, query string) (string, error) {
 	prompt := fmt.Sprintf(
 		"You are a helpful assistant that converts natural language descriptions into shell commands. "+
-		"Respond with ONLY the command, no explanations, no markdown formatting, no quotes. "+
-		"If you're unsure, provide the most likely command.\n\n"+
-		"User request: %s\n\n"+
-		"Shell command:",
+			"Respond with ONLY the command, no explanations, no markdown formatting, no quotes. "+
+			"If you're unsure, provide the most likely command.\n\n"+
+			"User request: %s\n\n"+
+			"Shell command:",
 		query,
 	)
 
@@ -556,9 +588,15 @@ func (m *Model) Cleanup() {
 	if m.pty != nil {
 		m.pty.Close()
 	}
-	if m.cmd != nil && m.cmd.Process != nil {
-		m.cmd.Process.Kill()
-	}
+}
+
+// printVersion prints version information
+func printVersion() {
+	fmt.Printf("%s version %s\n", AppName, Version)
+	fmt.Printf("  Build time: %s\n", BuildTime)
+	fmt.Printf("  Git commit: %s\n", GitCommit)
+	fmt.Printf("  Go version: %s\n", runtime.Version())
+	fmt.Printf("  OS/Arch:    %s/%s\n", runtime.GOOS, runtime.GOARCH)
 }
 
 // printHelp prints the help message
@@ -571,6 +609,7 @@ USAGE:
   ai-terminal-tui [COMMAND] [OPTIONS]
 
 COMMANDS:
+  version                   Show version information
   setup                     Interactive setup wizard
   config                    Show current configuration
   config --show             Same as 'config'
@@ -583,11 +622,14 @@ CONFIGURATION KEYS:
   litellm_url    - LiteLLM API URL (default: http://localhost:4000)
   litellm_token  - LiteLLM API token
   model          - Model to use (default: gpt-4)
-  shell          - Shell to use (default: $SHELL or /bin/bash)
+  shell          - Shell to use (default: auto-detected)
 
 EXAMPLES:
   # Run TUI mode (requires TTY)
   ai-terminal-tui
+
+  # Show version
+  ai-terminal-tui version
 
   # Setup wizard
   ai-terminal-tui setup
@@ -780,8 +822,8 @@ func main() {
 			printHelp()
 			os.Exit(0)
 
-		case "--version", "-v":
-			fmt.Printf("%s version %s\n", AppName, Version)
+		case "--version", "-v", "version":
+			printVersion()
 			os.Exit(0)
 
 		case "setup":
